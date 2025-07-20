@@ -1,14 +1,21 @@
 # --- START OF FILE hardware_grid_visualizer_qt.py ---
 import numpy as np
-from vedo import Text2D, Rectangle, colors, Plotter # Plotter for type hint
+from vedo import Text2D, Rectangle, colors, Line, Spline, Points
 import logging
 from points_array import PointsArray 
 import vtk
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class HardwareGridVisualizerQt:
-    def __init__(self, processor_instance, parent_plotter_instance, renderer_index):
+    TOOTH_WIDTH_PROPORTIONS = {
+        "Central Incisor": 1.00, "Lateral Incisor": 0.78, "Canine": 0.89,
+        "1st Premolar": 0.75, "2nd Premolar": 0.70, "1st Molar": 1.20, "2nd Molar": 1.10,
+    }
+    TOOTH_ORDER = ["Central Incisor", "Lateral Incisor", "Canine", "1st Premolar", "2nd Premolar", "1st Molar", "2nd Molar"]
+
+    def __init__(self, processor_instance, parent_plotter_instance, renderer_index, user_central_incisor_width=9.0):
         self.processor = processor_instance 
         self.parent_plotter = parent_plotter_instance
         self.renderer_index = renderer_index
@@ -18,93 +25,252 @@ class HardwareGridVisualizerQt:
         self.points_array_checker = PointsArray()
         self.max_force_for_scaling = 1000.0 
         
-        # --- PERSISTENT ACTORS ---
-        self.cell_rect_actors = {} # Dict: {(r, c): vedo.Rectangle}
-        self.time_text_actor = None # Still recreated, simple enough
-        # ---
+        self.cell_rect_actors = {} 
+        self.time_text_actor = None
+        self.segment_boundary_lines = []
+        self.arch_boundary_splines = []
+        self.segment_control_points_actors = []
         
-        self.timestamps = self.processor.timestamps
-        self.current_timestamp_idx = 0; self.last_animated_timestamp = None
-        self.main_app_window_ref = None
+        self.user_ci_width = user_central_incisor_width
+        # --- REVISED PARAMETERS FOR BETTER FIT ---
+        self.arch_params = {
+            'grid_cell_size_mm': 0.7, 
+            'width_scale': 0.4,        # Fit 98% of the valid grid width
+            'depth_scale': 0.99,         # Arch depth is 50% of the valid grid height
+            'anterior_flatness': 0.2,   # A value around 0.5 gives a good U-shape
+            'lingual_curve_offset': 3.5, # Inner curve depth relative to outer curve
+            'vertical_offset_factor': -0.09, # Shift arch up/down (+ is up) as a fraction of valid grid height
+        }
+        # ---
 
-        if not self.renderer: logging.error(f"HwGridViz (R{self.renderer_index}): Renderer not provided."); return
-        if self.processor.cleaned_data is None: self.processor.create_force_matrix() # Ensure data for timestamps
+        if not self.renderer: logger.error(f"HwGridViz (R{self.renderer_index}): Renderer not provided."); return
+        if self.processor.cleaned_data is None: self.processor.create_force_matrix()
 
-    def set_main_app_window_ref(self, main_app_window_instance): # Same
-        self.main_app_window_ref = main_app_window_instance
-
-    def setup_scene(self): # Creates persistent actors
+    def setup_scene(self):
+        # ... (This function remains unchanged) ...
         if not self.renderer or not self.parent_plotter: return
-        logging.info(f"HwGridViz (R{self.renderer_index}): Setting up scene with persistent actors...")
+        logger.info(f"HwGridViz (R{self.renderer_index}): Setting up scene with segments...")
         self.parent_plotter.at(self.renderer_index)
         cam = self.parent_plotter.camera
         cam.ParallelProjectionOn()
-
-        self._create_and_add_grid_rects_once() # This now creates AND ADDS them once
-
-        # Camera fitting after actors are added
+        self._create_and_add_grid_rects_once()
+        self._create_default_segment_boundaries()
+        self._add_segment_actors_to_renderer()
         cell_render_size = 0.25 
-        grid_render_width = self.hw_cols * cell_render_size
         grid_render_height = self.hw_rows * cell_render_size
-        cam.SetFocalPoint(0,0,0) # Assuming grid is centered by _create_and_add_grid_rects_once
-        cam.SetPosition(0,0, (grid_render_height/2) / np.tan(np.radians(cam.GetViewAngle()/2)) * 1.5 ) # Basic perspective distance
-        # For parallel projection:
-        cam.SetPosition(0, 0, 20) # Adjust Z for desired view
+        cam.SetFocalPoint(0,0,0)
+        cam.SetPosition(0, 0, 20)
         cam.SetViewUp(0, 1, 0)     
-        cam.SetParallelScale(grid_render_height / 1.8) 
-
+        cam.SetParallelScale(grid_render_height / 1.7) 
         self.renderer.ResetCamera()
         self.renderer.ResetCameraClippingRange()
-        self.renderer.SetBackground(0.93, 0.93, 0.97) # Light lavender
-        logging.info(f"HwGridViz (R{self.renderer_index}): Scene setup complete.")
+        self.renderer.SetBackground(0.93, 0.93, 0.97)
+        logger.info(f"HwGridViz (R{self.renderer_index}): Scene setup complete.")
 
     def _create_and_add_grid_rects_once(self):
+        # ... (This function remains unchanged) ...
         if not self.renderer: 
-            logging.warning(f"HwGridViz (R{self.renderer_index if hasattr(self, 'renderer_index') else 'N/A'}): Renderer not available for creating grid rects.")
+            logger.warning(f"HwGridViz (R{self.renderer_index}): Renderer not available for creating grid rects.")
             return
-            
-        if self.cell_rect_actors: # Clear existing if any
-            # Get the vtkActor from each Vedo Rectangle object for removal
-            vtk_actors_to_remove = [rect.actor for rect in self.cell_rect_actors.values() if hasattr(rect, 'actor')]
-            for act in vtk_actors_to_remove:
-                self.renderer.RemoveActor(act) # Remove individual vtkActors
+        if self.cell_rect_actors: 
+            for act in [rect.actor for rect in self.cell_rect_actors.values() if hasattr(rect, 'actor')]:
+                self.renderer.RemoveActor(act)
             self.cell_rect_actors.clear()
-
         cell_size = 0.25; padding = 0.005 
-        effective_cell_draw_size = cell_size - padding
-        half_draw_size = effective_cell_draw_size / 2.0
         total_grid_visual_width = self.hw_cols * cell_size
         total_grid_visual_height = self.hw_rows * cell_size
-        # Center the grid around (0,0) in its local XY plane
         offset_x = -total_grid_visual_width / 2
         offset_y = -total_grid_visual_height / 2 
-        
-        logging.info(f"HwGridViz: Creating {self.hw_rows*self.hw_cols} potential rectangle objects...")
-        
         for r_idx in range(self.hw_rows):
             for c_idx in range(self.hw_cols):
                 cell_center_x = offset_x + (c_idx * cell_size) + cell_size / 2
-                cell_center_y = offset_y + ((self.hw_rows - 1 - r_idx) * cell_size) + cell_size / 2 # r=0 is top row
-                
-                p1x = cell_center_x - half_draw_size
-                p1y = cell_center_y - half_draw_size
-                p2x = cell_center_x + half_draw_size
-                p2y = cell_center_y + half_draw_size
-                
+                cell_center_y = offset_y + ((self.hw_rows - 1 - r_idx) * cell_size) + cell_size / 2 
+                p1x, p1y = cell_center_x - (cell_size-padding)/2, cell_center_y - (cell_size-padding)/2
+                p2x, p2y = cell_center_x + (cell_size-padding)/2, cell_center_y + (cell_size-padding)/2
                 rect = Rectangle((p1x, p1y), (p2x, p2y), c='lightgrey', alpha=0.1)
                 rect.lw(0) 
-                if not self.points_array_checker.is_valid(c_idx, r_idx):
-                    rect.alpha(0) 
-                
+                if not self.points_array_checker.is_valid(c_idx, r_idx): rect.alpha(0) 
                 self.cell_rect_actors[(r_idx, c_idx)] = rect 
-                # --- CORRECTED: Add individual VTK actor ---
-                if hasattr(rect, 'actor') and rect.actor: # Ensure it's a Vedo visual object with a vtkActor
-                    self.renderer.AddActor(rect.actor)
-                # --- END CORRECTION ---
+                if hasattr(rect, 'actor') and rect.actor: self.renderer.AddActor(rect.actor)
+
+
+    # In hardware_grid_visualizer_qt.py
+
+    def update_arch_parameters(self, user_central_incisor_width=None, arch_params=None):
+        """
+        Public method to update arch parameters and trigger a redraw of the overlay.
+        Corrects the actor removal logic.
+        """
+        logger.info("Updating arch parameters...")
         
-        logging.info(f"HwGridViz (R{self.renderer_index if hasattr(self, 'renderer_index') else 'N/A'}): Added {len(self.cell_rect_actors)} cell rectangles to renderer.")
+        # Update parameters
+        if user_central_incisor_width is not None:
+            self.user_ci_width = user_central_incisor_width
+            logger.info(f"  - Central Incisor Width set to: {self.user_ci_width} mm")
+        if arch_params is not None:
+            self.arch_params.update(arch_params)
+            logger.info(f"  - Arch shape parameters updated.")
+
+        # --- CORRECTED REMOVAL LOGIC ---
+        # 1. Get a reference to the list of actors CURRENTLY in the scene.
+        actors_to_remove = self.segment_boundary_lines + self.arch_boundary_splines
         
-    def _value_to_color_hardware(self, value, sensitivity=1): # Same
+        # 2. Use the plotter to remove these specific actors.
+        if self.parent_plotter and actors_to_remove:
+            self.parent_plotter.at(self.renderer_index)
+            self.parent_plotter.remove(actors_to_remove) # render=False to prevent unnecessary redraw
+            logger.info(f"Removed {len(actors_to_remove)} old arch segment actors.")
+        
+        # 3. Now that the old actors are gone from the scene, clear our Python lists.
+        #    _create_default_segment_boundaries already does this, so this is just for clarity.
+        self.segment_boundary_lines.clear()
+        self.arch_boundary_splines.clear()
+        # --- END CORRECTED REMOVAL LOGIC ---
+
+        # 4. Re-create the new arch boundaries (this will repopulate the cleared lists).
+        self._create_default_segment_boundaries()
+        
+        # 5. Add the new arch actors to the renderer.
+        self._add_segment_actors_to_renderer()
+        
+        # 6. Trigger a final render to show the new state.
+        if self.parent_plotter and self.parent_plotter.qt_widget:
+            self.parent_plotter.qt_widget.Render()
+    # In HardwareGridVisualizerQt
+
+    def _calculate_arch_points(self):
+        """
+        Generates two equidistant, U-shaped curves whose ends connect to the respective
+        outer and inner top corners of the valid grid area.
+        """
+        # 1. Find the bounding box of the VISIBLE/VALID grid cells (remains the same)
+        cell_size = 0.25
+        grid_offset_x = -(self.hw_cols * cell_size) / 2
+        grid_offset_y = -(self.hw_rows * cell_size) / 2
+        
+        valid_x_coords, valid_y_coords = [], []
+        for r_idx in range(self.hw_rows):
+            for c_idx in range(self.hw_cols):
+                if self.points_array_checker.is_valid(c_idx, r_idx):
+                    cell_center_x = grid_offset_x + (c_idx * cell_size) + cell_size / 2
+                    cell_center_y = grid_offset_y + ((self.hw_rows - 1 - r_idx) * cell_size) + cell_size / 2
+                    valid_x_coords.append(cell_center_x)
+                    valid_y_coords.append(cell_center_y)
+
+        if not valid_x_coords:
+            logger.warning("No valid grid cells found to draw arch on.")
+            return [], [], []
+
+        min_x_grid, max_x_grid = min(valid_x_coords), max(valid_x_coords)
+        min_y_grid, max_y_grid = min(valid_y_coords), max(valid_y_coords)
+        valid_grid_width = max_x_grid - min_x_grid
+        valid_grid_height = max_y_grid - min_y_grid
+        grid_center_x = (min_x_grid + max_x_grid) / 2
+        
+        # 2. Define Arch Dimensions (remains the same)
+        arch_a = (valid_grid_width / 2.0) * self.arch_params['width_scale']
+        arch_b = arch_a * self.arch_params['depth_scale']
+        
+        # 3. Define the BASE arch curve function (remains the same)
+        def get_base_y(x_relative, semi_major_a, semi_minor_b):
+            flat_zone_half_width = semi_major_a * self.arch_params['anterior_flatness']
+            if abs(x_relative) <= flat_zone_half_width: return semi_minor_b
+            else:
+                curve_zone_width = semi_major_a - flat_zone_half_width
+                if curve_zone_width <= 0: return semi_minor_b
+                x_normalized_for_curve = (abs(x_relative) - flat_zone_half_width) / curve_zone_width
+                return semi_minor_b * np.sqrt(max(0, 1 - x_normalized_for_curve**2))
+
+        # 4. Generate points and normals for the main U-shaped part of the arch (remains the same)
+        points_outer, points_inner = [], []
+        num_spline_points = 200
+        base_outer_curve_points = []
+        x_spline_start = -arch_a; x_spline_end = arch_a
+        for i in range(num_spline_points + 1):
+            x = x_spline_start + (x_spline_end - x_spline_start) * i / num_spline_points
+            y_base = get_base_y(x, arch_a, arch_b)
+            base_outer_curve_points.append(np.array([x, y_base]))
+        normals = []
+        for i in range(len(base_outer_curve_points)):
+            if i == 0: tangent = base_outer_curve_points[i+1] - base_outer_curve_points[i]
+            elif i == len(base_outer_curve_points) - 1: tangent = base_outer_curve_points[i] - base_outer_curve_points[i-1]
+            else: tangent = base_outer_curve_points[i+1] - base_outer_curve_points[i-1]
+            tangent_norm = np.linalg.norm(tangent)
+            if tangent_norm > 0: tangent /= tangent_norm
+            normal = np.array([-tangent[1], tangent[0]])
+            if normal[1] < 0: normal *= -1
+            normals.append(normal)
+
+        # 5. Create final outer and inner curves by positioning and offsetting (remains the same)
+        y_shift = max_y_grid - arch_b + (valid_grid_height * self.arch_params['vertical_offset_factor'])
+        offset_distance = self.arch_params['lingual_curve_offset']
+        for i in range(len(base_outer_curve_points)):
+            point = base_outer_curve_points[i]
+            normal = normals[i]
+            final_outer_point = np.array([point[0] + grid_center_x, -point[1] + y_shift])
+            points_outer.append(final_outer_point.tolist())
+            inner_point_base = point + normal * offset_distance
+            final_inner_point = np.array([inner_point_base[0] + grid_center_x, -inner_point_base[1] + y_shift])
+            points_inner.append(final_inner_point.tolist())
+
+        # 6. Calculate interproximal lines (remains the same)
+        interproximal_lines = []
+        total_segments = 14
+        interproximal_lines.append( (points_outer[0], points_inner[0]) )
+        for i in range(1, total_segments):
+            point_index = int(i * (num_spline_points / total_segments))
+            if point_index >= len(points_outer): continue
+            p_outer = points_outer[point_index]
+            p_inner = points_inner[point_index]
+            interproximal_lines.append( (p_outer, p_inner) )
+        interproximal_lines.append( (points_outer[-1], points_inner[-1]) )
+        
+        # *** 7. CORRECTED: REPLACE ENDPOINTS TO CONNECT TO SEPARATE CORNERS ***
+        # Define the target corners for the OUTER curve
+        target_top_left_outer = [min_x_grid, max_y_grid]
+        target_top_right_outer = [max_x_grid, max_y_grid]
+
+        # Define the target corners for the INNER curve, inset by the offset distance
+        # This assumes the ends of the arch are mostly vertical
+        target_top_left_inner = [min_x_grid + offset_distance, max_y_grid]
+        target_top_right_inner = [max_x_grid - offset_distance, max_y_grid]
+        
+        # Replace the first point of each curve with its respective top-left corner
+        points_outer[0] = target_top_left_inner
+        points_inner[0] = target_top_left_outer
+
+        # Replace the last point of each curve with its respective top-right corner
+        points_outer[-1] = target_top_right_inner
+        points_inner[-1] = target_top_right_outer
+        # *** END CORRECTION ***
+        
+        return interproximal_lines, points_outer, points_inner
+
+    def _create_default_segment_boundaries(self):
+        # ... (This function remains unchanged) ...
+        self.segment_boundary_lines.clear()
+        self.arch_boundary_splines.clear()
+        interprox_line_coords, outer_spline_points, inner_spline_points = self._calculate_arch_points()
+        for p1, p2 in interprox_line_coords:
+            line = Line(p1, p2, c='royalblue', lw=2, alpha=0.7)
+            self.segment_boundary_lines.append(line)
+        if outer_spline_points:
+            outer_spline = Spline(outer_spline_points); outer_spline.color('darkblue').linewidth(2).alpha(0.7)
+            self.arch_boundary_splines.append(outer_spline)
+        if inner_spline_points:
+            inner_spline = Spline(inner_spline_points); inner_spline.color('darkblue').linewidth(2).alpha(0.7)
+            self.arch_boundary_splines.append(inner_spline)
+        logger.info(f"Created {len(self.segment_boundary_lines)} segment boundary lines and {len(self.arch_boundary_splines)} arch splines.")
+
+    def _add_segment_actors_to_renderer(self):
+        # ... (This function remains unchanged) ...
+        all_segment_actors = self.segment_boundary_lines + self.arch_boundary_splines
+        for actor in all_segment_actors:
+            if hasattr(actor, 'actor') and actor.actor: self.renderer.AddActor(actor.actor)
+            else: self.renderer.AddActor(actor)
+    
+    def _value_to_color_hardware(self, value, sensitivity=1):
+        # ... (This function remains unchanged) ...
         mapped_value = (value / sensitivity * 255) // self.max_force_for_scaling; mapped_value = min(255,max(0,int(mapped_value)))
         r,g,b = 200,200,200 
         if mapped_value>204:r=255;g=max(0,int(150-((mapped_value-204)*150/51)));b=0
@@ -114,49 +280,38 @@ class HardwareGridVisualizerQt:
         return (r/255.0,g/255.0,b/255.0)
 
     def render_grid_view(self, timestamp, hardware_data_flat_array, sensitivity=1):
+        # ... (This function remains unchanged) ...
         if not self.renderer or not self.parent_plotter: return
-        self.parent_plotter.at(self.renderer_index) # Ensure context for Text2D positioning
-
-        # --- Update Time text (still recreated) ---
-        if self.time_text_actor: self.renderer.RemoveActor(self.time_text_actor.actor)
+        self.parent_plotter.at(self.renderer_index)
+        if self.time_text_actor: 
+            if hasattr(self.time_text_actor, 'actor') and self.time_text_actor.actor:
+                self.renderer.RemoveActor(self.time_text_actor.actor)
         self.time_text_actor = Text2D(f"HW Grid - T: {timestamp:.1f}s", pos="bottom-left", c='k', s=0.7)
-        self.renderer.AddActor(self.time_text_actor.actor) # Add new one
-
+        if hasattr(self.time_text_actor, 'actor') and self.time_text_actor.actor:
+            self.renderer.AddActor(self.time_text_actor.actor)
         if hardware_data_flat_array is None: 
-            # Optionally hide all cell_rect_actors if no data
             for rect_actor in self.cell_rect_actors.values(): rect_actor.alpha(0.05)
             return
-
         data_idx = 0
         for r_idx in range(self.hw_rows):
             for c_idx in range(self.hw_cols):
                 rect_actor = self.cell_rect_actors.get((r_idx, c_idx))
                 if not rect_actor: continue 
-
                 if self.points_array_checker.is_valid(c_idx, r_idx):
                     if data_idx < len(hardware_data_flat_array):
                         value = hardware_data_flat_array[data_idx]
                         color = self._value_to_color_hardware(value, sensitivity)
-                        # --- UPDATE EXISTING RECT ACTOR'S PROPERTIES ---
                         rect_actor.color(color).alpha(1.0 if value > 5 else 0.1) 
                         data_idx += 1
                     else: 
-                        rect_actor.alpha(0.1).color('lightgrey') # Not enough data, make dim
-                # else: Invalid cells were set to alpha(0) in _create_and_add_grid_rects_once and remain so
-        
-        # No explicit self.renderer.render() here; EmbeddedVedoMultiViewWidget handles it.
+                        rect_actor.alpha(0.1).color('lightgrey')
 
-    def animate(self, timestamp_to_render, hardware_data_for_timestamp=None, sensitivity=1): # Same
-        self.last_animated_timestamp = timestamp_to_render
+    def animate(self, timestamp_to_render, hardware_data_for_timestamp=None, sensitivity=1):
         self.render_grid_view(timestamp_to_render, hardware_data_for_timestamp, sensitivity)
 
-    def get_frame_as_array(self, timestamp_to_render, hardware_data_for_timestamp=None, sensitivity=1): # Same
-        # ... (This method returns None, main multiview widget screenshots itself)
+    def get_frame_as_array(self, timestamp_to_render, hardware_data_for_timestamp=None, sensitivity=1):
         if not self.renderer or not self.parent_plotter: return None
         self.parent_plotter.at(self.renderer_index)
         self.render_grid_view(timestamp_to_render, hardware_data_for_timestamp, sensitivity)
-        return None # Main multiview widget does the screenshot of the whole window
-
-    # _on_mouse_click would need to be adapted if picking persistent rect_actors
-    # self.set_main_app_window_ref(...) remains the same
+        return None 
 # --- END OF FILE hardware_grid_visualizer_qt.py ---

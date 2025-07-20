@@ -8,8 +8,9 @@ import atexit
 import os
 import collections # For deque if we were to implement more complex buffering
 
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSizePolicy
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSizePolicy, QLineEdit
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal
+from PyQt5.QtGui import QDoubleValidator
 import vedo
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
@@ -72,7 +73,8 @@ class EmbeddedVedoMultiViewWidget(QWidget):
                  HardwareGridVisualizerClass,
                  Hw3DBarVisualizerClass,
                  parent_main_window,
-                 plotter_kwargs=None):
+                 plotter_kwargs=None,
+                 initial_ci_width=9.0):
         super().__init__(parent_main_window)
         if plotter_kwargs is None: plotter_kwargs = {}
 
@@ -94,6 +96,7 @@ class EmbeddedVedoMultiViewWidget(QWidget):
         self._HardwareGridVisualizerClass = HardwareGridVisualizerClass
         self._Hw3DBarVisualizerClass = Hw3DBarVisualizerClass
         self._parent_main_window = parent_main_window
+        self._initial_ci_width = initial_ci_width # <-- STORE THE VALUE
 
         self.grid_visualizer = None
         self.bar_visualizer = None
@@ -258,6 +261,9 @@ class MainAppWindow(QMainWindow):
         self.video_frame_skip = max(1, int(self.live_animation_fps / self.video_output_fps))
         self.frames_rendered_since_last_video_write = 0
         self.video_writer = None 
+
+        self.current_ci_width = 9.0 # Default value in mm
+
         
         global _main_app_window_instance_for_atexit
         _main_app_window_instance_for_atexit = self
@@ -276,7 +282,9 @@ class MainAppWindow(QMainWindow):
             HardwareGridVisualizerQt,
             Hardware3DBarVisualizerQt, 
             self, 
-            plotter_kwargs={'title': "Dental Force Views"}
+            plotter_kwargs={'title': "Dental Force Views"},
+            initial_ci_width=self.current_ci_width # Pass the initial value
+
         )
         self.vedo_multiview_widget.vedo_initialized_signal.connect(self.perform_initial_view_update)
         
@@ -351,15 +359,45 @@ class MainAppWindow(QMainWindow):
         return self.video_writer is not None and self.video_writer.isOpened()
     
     def _setup_ui(self):
-        # ... (as before) ...
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+
         top_area_layout = QHBoxLayout()
-        top_area_layout.addWidget(self.vedo_multiview_widget, 3) 
-        top_area_layout.addWidget(self.detailed_info_label, 1)   
-        main_layout.addLayout(top_area_layout, 3) 
-        main_layout.addWidget(self.graph_qt_canvas, 2) 
+        top_area_layout.addWidget(self.vedo_multiview_widget, 3)
+
+        # Control panel on the right
+        control_panel_layout = QVBoxLayout()
+        self.detailed_info_label = QLabel("Click an element for details.")
+        self.detailed_info_label.setWordWrap(True)
+        self.detailed_info_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        control_panel_layout.addWidget(self.detailed_info_label)
+        
+        # --- UI for User to Input Central Incisor Width ---
+        arch_controls_layout = QHBoxLayout()
+        arch_label = QLabel("CI Width (mm):")
+        self.ci_width_input = QLineEdit(str(self.current_ci_width))
+        self.ci_width_input.setValidator(QDoubleValidator(5.0, 15.0, 2)) # Min 5mm, Max 15mm, 2 decimals
+        self.ci_width_input.setFixedWidth(50)
+        
+        update_arch_button = QPushButton("Update Arch")
+        update_arch_button.clicked.connect(self.on_update_arch_clicked)
+        
+        arch_controls_layout.addWidget(arch_label)
+        arch_controls_layout.addWidget(self.ci_width_input)
+        
+        control_panel_layout.addLayout(arch_controls_layout)
+        control_panel_layout.addWidget(update_arch_button)
+        # --- END UI for User Input ---
+
+        control_panel_layout.addStretch() # Pushes controls to the top
+        top_area_layout.addLayout(control_panel_layout, 1)
+
+        main_layout.addLayout(top_area_layout, 3)
+        main_layout.addWidget(self.graph_qt_canvas, 2)
+
+        # --- Bottom Controls (Play/Pause, Reset View) ---
+        # ... (This part is unchanged) ...
         controls_layout = QHBoxLayout()
         self.play_pause_button = QPushButton("Play Animation")
         self.play_pause_button.clicked.connect(self.toggle_animation)
@@ -486,6 +524,35 @@ class MainAppWindow(QMainWindow):
         if self.processor.timestamps and len(self.processor.timestamps) > 0 and \
            not (self.hw_data_source and hasattr(self.hw_data_source, 'running') and self.hw_data_source.running):
             self.current_timestamp_idx += 1
+
+    def on_update_arch_clicked(self):
+        """
+        Reads the CI width from the user input and tells the visualizer to redraw the arch.
+        """
+        try:
+            new_width_str = self.ci_width_input.text()
+            new_width = float(new_width_str)
+            
+            if 5.0 <= new_width <= 15.0:
+                self.current_ci_width = new_width
+                logging.info(f"User requested arch update. New CI Width: {self.current_ci_width} mm")
+                
+                # Call the update method on the grid visualizer
+                if self.vedo_multiview_widget and self.vedo_multiview_widget.grid_visualizer and \
+                   hasattr(self.vedo_multiview_widget.grid_visualizer, 'update_arch_parameters'):
+                    
+                    self.vedo_multiview_widget.grid_visualizer.update_arch_parameters(
+                        user_central_incisor_width=self.current_ci_width
+                    )
+                else:
+                    logging.warning("Grid visualizer not ready or does not support parameter updates.")
+            else:
+                logging.warning(f"Invalid CI width entered: {new_width}. Must be between 5.0 and 15.0.")
+                self.ci_width_input.setText(str(self.current_ci_width)) # Revert
+        except ValueError:
+            logging.error(f"Invalid input for CI width: '{self.ci_width_input.text()}'")
+            self.ci_width_input.setText(str(self.current_ci_width)) # Revert
+
 
     def update_graph_on_click(self, sel_tid=None): 
         # ... (as before) ...
