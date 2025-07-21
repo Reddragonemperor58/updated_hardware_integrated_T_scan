@@ -192,15 +192,23 @@ class EmbeddedVedoMultiViewWidget(QWidget):
         event.actor = original_actor_for_fallback
     
     # ... (update_views, get_frame_as_array, Render, get_grid_visualizer, get_bar_visualizer methods remain the same) ...
+    # In main_qt_app.py -> EmbeddedVedoMultiViewWidget
+
     def update_views(self, timestamp, latest_hardware_flat_data=None, sensitivity=1):
         if not self.grid_visualizer or not self.bar_visualizer:
+            return # Visualizers not yet initialized
+
+        # *** ROBUSTNESS CHECK FOR RENDERERS ***
+        if not self.main_plotter or len(self.main_plotter.renderers) < 2:
+            logging.error("update_views called but plotter/renderers are not ready. Aborting update.")
             return
+        # *** END CHECK ***
 
         if hasattr(self.grid_visualizer, 'animate'):
-            self.main_plotter.at(0)
+            self.main_plotter.at(0) 
             self.grid_visualizer.animate(timestamp, latest_hardware_flat_data, sensitivity)
         if hasattr(self.bar_visualizer, 'animate'):
-            self.main_plotter.at(1)
+            self.main_plotter.at(1) 
             self.bar_visualizer.animate(timestamp, latest_hardware_flat_data, sensitivity)
         
         self.Render()
