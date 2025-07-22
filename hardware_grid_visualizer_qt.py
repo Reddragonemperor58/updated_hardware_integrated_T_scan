@@ -1,6 +1,6 @@
 # --- START OF FILE hardware_grid_visualizer_qt.py ---
 import numpy as np
-from vedo import Text2D, Rectangle, colors, Line, Spline, Points, Text3D # Use Text instead of Text3D
+from vedo import Text2D, Rectangle, colors, Line, Spline, Points, Text3D, Polygon, Mesh
 import logging
 from points_array import PointsArray 
 import vtk
@@ -31,6 +31,7 @@ class HardwareGridVisualizerQt:
         self.segment_control_points_actors = [] # Placeholder for future interactivity
         self.segment_text_actors = [] # Will hold the Text3D labels
         self.segment_polygons = []
+        self.segment_polygon_actors = [] # NEW: To hold the visible tooth segment actors
         self.segment_cell_map = {}
         
         self.user_ci_width = user_central_incisor_width
@@ -53,10 +54,16 @@ class HardwareGridVisualizerQt:
         self.parent_plotter.at(self.renderer_index)
         cam = self.parent_plotter.camera
         cam.ParallelProjectionOn()
+
         self._create_and_add_grid_rects_once()
-        self._rebuild_arch_overlay_actors() # This now creates lines, splines, and text
+        
+        # This one function now does all the work of creating lines, splines, and text
+        self._rebuild_arch_overlay_actors() 
+        
+        # Map cells after the polygons have been defined inside _rebuild_arch_overlay_actors
         self._map_cells_to_segments()
         
+        # Camera setup
         cell_render_size = 0.25 
         grid_render_height = self.hw_rows * cell_render_size
         cam.SetFocalPoint(0,0,0)
@@ -93,28 +100,28 @@ class HardwareGridVisualizerQt:
 
     # In hardware_grid_visualizer_qt.py
 
+    # In hardware_grid_visualizer_qt.py
+
     def _rebuild_arch_overlay_actors(self):
         """
-        Removes all old overlay actors (lines, splines, text) and creates/adds new ones.
-        This is the single source of truth for the arch overlay.
+        Removes all old overlay actors (lines, splines, text, polygons) and creates/adds new ones.
         """
-        # 1. Remove all existing overlay actors from the scene
-        all_overlay_actors = self.segment_boundary_lines + self.arch_boundary_splines + self.segment_text_actors
+        all_overlay_actors = self.segment_boundary_lines + self.arch_boundary_splines + \
+                             self.segment_text_actors + self.segment_polygon_actors
         if self.parent_plotter and all_overlay_actors:
             self.parent_plotter.at(self.renderer_index)
             self.parent_plotter.remove(all_overlay_actors)
         
-        # 2. Clear the internal Python lists
         self.segment_boundary_lines.clear()
         self.arch_boundary_splines.clear()
         self.segment_text_actors.clear()
+        self.segment_polygon_actors.clear()
+        self.segment_polygons.clear()
 
-        # 3. Generate the geometric points for the new arch
         interprox_line_coords, outer_spline_points, inner_spline_points = self._calculate_arch_points()
         
-        # 4. Create the new vedo objects (Lines, Splines)
         for p1, p2 in interprox_line_coords:
-            line = Line(p1, p2, c='royalblue', lw=2, alpha=0.7)
+            line = Line(p1, p2, c='royalblue', lw=1, alpha=0.5)
             self.segment_boundary_lines.append(line)
         if outer_spline_points:
             outer_spline = Spline(outer_spline_points); outer_spline.color('darkblue').linewidth(2).alpha(0.7)
@@ -123,38 +130,45 @@ class HardwareGridVisualizerQt:
             inner_spline = Spline(inner_spline_points); inner_spline.color('darkblue').linewidth(2).alpha(0.7)
             self.arch_boundary_splines.append(inner_spline)
 
-        # 5. Create the new Text3D actors
-        num_segments = len(interprox_line_coords) - 1 if interprox_line_coords else 0
-        text_height = 0.5
-        for i in range(num_segments):
-            text_actor = Text3D(f"{i+1}", s=text_height, justify='center', c='black')
+        sorted_lines = sorted(self.segment_boundary_lines, key=lambda line: line.center_of_mass()[0])
+        for i in range(len(sorted_lines) - 1):
+            left_line = sorted_lines[i]; right_line = sorted_lines[i+1]
+            left_pts = left_line.points; right_pts = right_line.points
+            if left_pts is None or len(left_pts)<2 or right_pts is None or len(right_pts)<2: continue
+            if left_pts[0][1] > left_pts[1][1]: p_left_outer, p_left_inner = left_pts[0], left_pts[1]
+            else: p_left_inner, p_left_outer = left_pts[0], left_pts[1]
+            if right_pts[0][1] > right_pts[1][1]: p_right_outer, p_right_inner = right_pts[0], right_pts[1]
+            else: p_right_inner, p_right_outer = right_pts[0], right_pts[1]
+            poly_points = np.array([p_left_outer, p_right_outer, p_right_inner, p_left_inner])
+            self.segment_polygons.append(poly_points)
+            poly_actor = Mesh([poly_points, [[0,1,2,3]]]).z(0.05).color('lightgrey').alpha(0.8).linewidth(1).linecolor('black')
+            self.segment_polygon_actors.append(poly_actor)
+
+        for i in range(len(self.segment_polygon_actors)):
+            text_actor = Text3D(f"{i+1}", s=0.5, justify='center', c='black')
             text_actor.follow_camera()
             self.segment_text_actors.append(text_actor)
 
-        # *** 6. CORRECTED AND ROBUST ACTOR ADDITION LOGIC ***
-        new_actors_to_add = self.segment_boundary_lines + self.arch_boundary_splines + self.segment_text_actors
+        # *** CORRECTED AND ROBUST ACTOR ADDITION LOGIC ***
+        new_actors_to_add = self.segment_boundary_lines + self.arch_boundary_splines + \
+                             self.segment_polygon_actors + self.segment_text_actors
         for vedo_obj in new_actors_to_add:
             if vedo_obj is None:
                 continue
             
-            # Check if the object has a .actor attribute that should be used
-            # This is common for objects that are assemblies or more complex.
-            # For Line and Spline, the object itself IS the actor.
-            actor_to_add = None
-            if hasattr(vedo_obj, 'actor') and vedo_obj.actor is not None:
-                actor_to_add = vedo_obj.actor
+            # Use the higher-level Plotter.add() method which is more robust
+            # to different Vedo object types.
+            if self.parent_plotter:
+                self.parent_plotter.at(self.renderer_index)
+                self.parent_plotter.add(vedo_obj)
             else:
-                # Assume the object itself is a vtkProp (like Line, Spline, Text3D)
-                actor_to_add = vedo_obj
-            
-            if actor_to_add:
+                # Fallback to direct renderer.AddActor if plotter is not available
+                # This requires more careful handling of actor types
+                actor_to_add = vedo_obj.actor if hasattr(vedo_obj, 'actor') and vedo_obj.actor else vedo_obj
                 self.renderer.AddActor(actor_to_add)
-            else:
-                logger.warning(f"Could not find a valid vtkProp to add for object of type {type(vedo_obj)}")
-        # *** END CORRECTION ***
 
-        logger.info(f"Rebuilt arch overlay with {len(new_actors_to_add)} objects.")
-
+        logger.info(f"Rebuilt arch overlay with {len(new_actors_to_add)} actors.")
+        
     def _create_and_add_grid_rects_once(self):
         # ... (This function remains unchanged) ...
         if not self.renderer: 
@@ -175,11 +189,14 @@ class HardwareGridVisualizerQt:
                 cell_center_y = offset_y + ((self.hw_rows - 1 - r_idx) * cell_size) + cell_size / 2 
                 p1x, p1y = cell_center_x - (cell_size-padding)/2, cell_center_y - (cell_size-padding)/2
                 p2x, p2y = cell_center_x + (cell_size-padding)/2, cell_center_y + (cell_size-padding)/2
-                rect = Rectangle((p1x, p1y), (p2x, p2y), c='lightgrey', alpha=0.1)
+                rect = Rectangle((p1x, p1y), (p2x, p2y), c='lightgrey', alpha=0.0) # Set alpha to 0.0
                 rect.lw(0) 
+                # The is_valid check is no longer needed for visibility, but doesn't hurt
                 if not self.points_array_checker.is_valid(c_idx, r_idx): rect.alpha(0) 
+                
                 self.cell_rect_actors[(r_idx, c_idx)] = rect 
                 if hasattr(rect, 'actor') and rect.actor: self.renderer.AddActor(rect.actor)
+
 
 
     # In hardware_grid_visualizer_qt.py
@@ -193,7 +210,7 @@ class HardwareGridVisualizerQt:
             self.arch_params.update(arch_params)
             logger.info(f"  - Arch shape parameters updated.")
 
-        self._rebuild_arch_overlay_actors() # This single call now handles removing old and adding new
+        self._rebuild_arch_overlay_actors()
         self._map_cells_to_segments() # Re-map cells after arch is updated
         
         if self.parent_plotter and self.parent_plotter.qt_widget:
@@ -314,28 +331,28 @@ class HardwareGridVisualizerQt:
         
         return interproximal_lines, points_outer, points_inner
 
-    def _create_default_segment_boundaries(self):
-        # ... (This function remains unchanged) ...
-        self.segment_boundary_lines.clear()
-        self.arch_boundary_splines.clear()
-        interprox_line_coords, outer_spline_points, inner_spline_points = self._calculate_arch_points()
-        for p1, p2 in interprox_line_coords:
-            line = Line(p1, p2, c='royalblue', lw=2, alpha=0.7)
-            self.segment_boundary_lines.append(line)
-        if outer_spline_points:
-            outer_spline = Spline(outer_spline_points); outer_spline.color('darkblue').linewidth(2).alpha(0.7)
-            self.arch_boundary_splines.append(outer_spline)
-        if inner_spline_points:
-            inner_spline = Spline(inner_spline_points); inner_spline.color('darkblue').linewidth(2).alpha(0.7)
-            self.arch_boundary_splines.append(inner_spline)
-        logger.info(f"Created {len(self.segment_boundary_lines)} segment boundary lines and {len(self.arch_boundary_splines)} arch splines.")
+    # def _create_default_segment_boundaries(self):
+    #     # ... (This function remains unchanged) ...
+    #     self.segment_boundary_lines.clear()
+    #     self.arch_boundary_splines.clear()
+    #     interprox_line_coords, outer_spline_points, inner_spline_points = self._calculate_arch_points()
+    #     for p1, p2 in interprox_line_coords:
+    #         line = Line(p1, p2, c='royalblue', lw=2, alpha=0.7)
+    #         self.segment_boundary_lines.append(line)
+    #     if outer_spline_points:
+    #         outer_spline = Spline(outer_spline_points); outer_spline.color('darkblue').linewidth(2).alpha(0.7)
+    #         self.arch_boundary_splines.append(outer_spline)
+    #     if inner_spline_points:
+    #         inner_spline = Spline(inner_spline_points); inner_spline.color('darkblue').linewidth(2).alpha(0.7)
+    #         self.arch_boundary_splines.append(inner_spline)
+    #     logger.info(f"Created {len(self.segment_boundary_lines)} segment boundary lines and {len(self.arch_boundary_splines)} arch splines.")
 
-    def _add_segment_actors_to_renderer(self):
-        # ... (This function remains unchanged) ...
-        all_segment_actors = self.segment_boundary_lines + self.arch_boundary_splines
-        for actor in all_segment_actors:
-            if hasattr(actor, 'actor') and actor.actor: self.renderer.AddActor(actor.actor)
-            else: self.renderer.AddActor(actor)
+    # def _add_segment_actors_to_renderer(self):
+    #     # ... (This function remains unchanged) ...
+    #     all_segment_actors = self.segment_boundary_lines + self.arch_boundary_splines
+    #     for actor in all_segment_actors:
+    #         if hasattr(actor, 'actor') and actor.actor: self.renderer.AddActor(actor.actor)
+    #         else: self.renderer.AddActor(actor)
     
     def _value_to_color_hardware(self, value, sensitivity=1):
         # ... (This function remains unchanged) ...
@@ -351,91 +368,34 @@ class HardwareGridVisualizerQt:
 
     # In hardware_grid_visualizer_qt.py
 
+    # In hardware_grid_visualizer_qt.py
+
+    # In hardware_grid_visualizer_qt.py
+
     def _map_cells_to_segments(self):
-        """
-        Defines the 14 segment polygons from the arch lines and maps each valid grid cell
-        to a segment. Populates self.segment_cell_map.
-        Corrected to use .points as a property.
-        """
-        if not self.segment_boundary_lines or not self.arch_boundary_splines:
-            logger.warning("Cannot map cells to segments: Arch boundaries not yet created.")
+        if not self.segment_polygons:
+            logger.warning("Cannot map cells: segment polygons not defined.")
             return
 
-        # 1. Define the 14 segment polygons from the lines
-        self.segment_polygons = []
-        
-        # Sort the lines by the X-coordinate of their center of mass.
-        sorted_lines = sorted(
-            self.segment_boundary_lines, 
-            key=lambda line: line.center_of_mass()[0]
-        )
-
-        for i in range(len(sorted_lines) - 1): # For N lines, this creates N-1 polygons
-            left_line = sorted_lines[i]
-            right_line = sorted_lines[i+1]
-            
-            # *** CORRECTED: Access .points as a property, not a method ***
-            left_line_points = left_line.points
-            right_line_points = right_line.points
-            # *** END CORRECTION ***
-
-            # Ensure the points are valid before proceeding
-            if left_line_points is None or len(left_line_points) < 2 or \
-               right_line_points is None or len(right_line_points) < 2:
-                logger.warning(f"Skipping polygon creation due to invalid line points at index {i}.")
-                continue
-
-            # Determine which point is "outer" (higher Y value) and "inner" (lower Y value)
-            if left_line_points[0][1] > left_line_points[1][1]:
-                p_left_outer, p_left_inner = left_line_points[0], left_line_points[1]
-            else:
-                p_left_inner, p_left_outer = left_line_points[0], left_line_points[1]
-
-            if right_line_points[0][1] > right_line_points[1][1]:
-                p_right_outer, p_right_inner = right_line_points[0], right_line_points[1]
-            else:
-                p_right_inner, p_right_outer = right_line_points[0], right_line_points[1]
-
-            # The 4 corners of the segment polygon
-            poly = np.array([p_left_outer, p_right_outer, p_right_inner, p_left_inner])
-            self.segment_polygons.append(poly)
-
-        logger.info(f"Defined {len(self.segment_polygons)} segment polygons for mapping.")
-        if len(self.segment_polygons) == 0: return
-
-        # 2. Map valid grid cells to these polygons
         self.segment_cell_map = {i: [] for i in range(len(self.segment_polygons))}
-        
         cell_size = 0.25
         grid_offset_x = -(self.hw_cols * cell_size) / 2
         grid_offset_y = -(self.hw_rows * cell_size) / 2
-        
         from matplotlib.path import Path
-
         for r_idx in range(self.hw_rows):
             for c_idx in range(self.hw_cols):
                 if self.points_array_checker.is_valid(c_idx, r_idx):
                     cell_center_x = grid_offset_x + (c_idx * cell_size) + cell_size / 2
                     cell_center_y = grid_offset_y + ((self.hw_rows - 1 - r_idx) * cell_size) + cell_size / 2
                     cell_point = (cell_center_x, cell_center_y)
-
                     for seg_idx, polygon_points in enumerate(self.segment_polygons):
-                        # Use the 2D coordinates (X, Y) for the path
                         path = Path(polygon_points[:, :2])
                         if path.contains_point(cell_point):
                             self.segment_cell_map[seg_idx].append((r_idx, c_idx))
-                            break 
-
+                            break
         cell_counts = [len(cells) for cells in self.segment_cell_map.values()]
         logger.info(f"Cell mapping complete. Cells per segment: {cell_counts}")
 
-    # In hardware_grid_visualizer_qt.py
-
-    # In hardware_grid_visualizer_qt.py
-
-    # In hardware_grid_visualizer_qt.py
-
-    # In hardware_grid_visualizer_qt.py
 
     def render_grid_view(self, timestamp, hardware_data_flat_array, sensitivity=1):
         if not self.renderer or not self.parent_plotter: return
@@ -472,78 +432,48 @@ class HardwareGridVisualizerQt:
                     rect_actor.color('lightgrey').alpha(0.1)
 
         # Calculate and Display Force Percentages with "Outer Sunburst" Layout
-        total_force = np.sum(hardware_data_flat_array)
+        total_force = np.sum(hardware_data_flat_array) if hardware_data_flat_array is not None else 0
         
         if total_force < 1.0:
             for txt_actor in self.segment_text_actors: txt_actor.off()
-            return
+            for poly_actor in self.segment_polygon_actors: poly_actor.color('lightgrey') # Reset color
         else:
             for txt_actor in self.segment_text_actors: txt_actor.on()
+
+        for seg_idx in range(len(self.segment_polygons)):
+            if seg_idx >= len(self.segment_text_actors): continue # Safety check
             
-        # We need the points of the boundary splines to do this correctly
-        if not self.arch_boundary_splines or len(self.arch_boundary_splines) < 2:
-            logger.warning("Arch boundary splines not ready for text placement.")
-            return
-
-        outer_spline = self.arch_boundary_splines[0]
-        inner_spline = self.arch_boundary_splines[1]
-        
-        # Ensure they are in the correct order (outer should have lower Y values)
-        if outer_spline.center_of_mass()[1] > inner_spline.center_of_mass()[1]:
-            outer_spline, inner_spline = inner_spline, outer_spline
-
-        # *** CORRECTED: Access .points as a property ***
-        outer_points = outer_spline.points
-        inner_points = inner_spline.points
-        # *** END CORRECTION ***
-
-        if outer_points is None or inner_points is None:
-            logger.warning("Spline points are None, cannot place text.")
-            return
-
-        num_spline_points = len(outer_points) -1
-        # The number of segments is based on the number of text actors created
-        total_segments = len(self.segment_text_actors)
-
-        for seg_idx in range(total_segments):
-            if seg_idx >= len(self.segment_polygons): continue # Ensure we don't go out of bounds for polygon map
-
             segment_force = 0.0
-            for r_idx, c_idx in self.segment_cell_map.get(seg_idx, []):
-                segment_force += force_grid[r_idx, c_idx]
+            avg_force_val = 0.0
+            cells_in_segment = self.segment_cell_map.get(seg_idx, [])
+            
+            if cells_in_segment:
+                for r_idx, c_idx in cells_in_segment:
+                    segment_force += force_grid[r_idx, c_idx]
+                avg_force_val = segment_force / len(cells_in_segment)
             
             percentage = (segment_force / total_force * 100.0) if total_force > 0 else 0.0
             
+            # Update the color of the segment polygon
+            if seg_idx < len(self.segment_polygon_actors):
+                poly_actor = self.segment_polygon_actors[seg_idx]
+                # Use the average force value to determine the color of the whole segment
+                segment_color = self._value_to_color_hardware(avg_force_val, sensitivity)
+                poly_actor.color(segment_color)
+
+            # Update the text label (using the clean "outer sunburst" logic)
             text_actor = self.segment_text_actors[seg_idx]
-            
             if percentage < 0.5:
                 text_actor.off()
             else:
                 text_actor.on()
                 text_string = f"{percentage:.1f}%"
-                
                 if text_actor.text() != text_string:
                     text_actor.text(text_string)
                 
-                # "Outer Sunburst" POSITIONING LOGIC
-                start_idx = int(seg_idx * (num_spline_points / total_segments))
-                end_idx = int((seg_idx + 1) * (num_spline_points / total_segments))
+                center_point = np.mean(self.segment_polygons[seg_idx], axis=0)
+                text_actor.pos(center_point[0], center_point[1], 0.2) # Position in the center of the clean polygon
 
-                # Add a check to prevent index out of bounds
-                if start_idx >= len(outer_points) or end_idx >= len(outer_points): continue
-
-                mid_point_outer = np.mean(outer_points[start_idx:end_idx+1], axis=0)
-                mid_point_inner = np.mean(inner_points[start_idx:end_idx+1], axis=0)
-                
-                direction_vector = mid_point_outer - mid_point_inner
-                norm = np.linalg.norm(direction_vector)
-                if norm > 0:
-                    direction_vector /= norm
-
-                offset_distance = 1.0 
-                text_pos = mid_point_outer + direction_vector * offset_distance
-                
-                text_actor.pos(text_pos[0], text_pos[1], 0.2)
 
 
     def animate(self, timestamp_to_render, hardware_data_for_timestamp=None, sensitivity=1):
