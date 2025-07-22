@@ -601,7 +601,7 @@ if __name__ == '__main__':
     else: logging.warning("VTK module not directly imported in main.")
 
     sim_reader = SensorDataReader()
-    data = sim_reader.simulate_data(duration=5, num_teeth=16, num_sensor_points_per_tooth=4) 
+    data = sim_reader.simulate_data(duration=5, num_teeth=14, num_sensor_points_per_tooth=4) 
     processor = DataProcessor(data)
     processor.create_force_matrix()
 
