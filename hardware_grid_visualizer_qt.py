@@ -28,6 +28,7 @@ class HardwareGridVisualizerQt:
         self.presentation_actors = {} # The 16 T-Scan style shapes and their labels
         self.summary_bar_left, self.summary_bar_right = None, None
         self.summary_text_left, self.summary_text_right = None, None
+        self.bar_max_width = 7.0
         
         self.user_ci_width = user_central_incisor_width
         self.mapping_arch_params = { # Your tuned params for the real arch
@@ -275,84 +276,89 @@ class HardwareGridVisualizerQt:
 
     # In hardware_grid_visualizer_qt.py
 
+    # In hardware_grid_visualizer_qt.py
+
+    # In hardware_grid_visualizer_qt.py
+
     def render_grid_view(self, timestamp, hardware_data_flat_array, sensitivity=1):
-        if not self.presentation_actors: return
+        if not self.presentation_actors or not self.summary_bar_left:
+            return
+            
         self.parent_plotter.at(self.renderer_index)
         
-        # Update time text
         if self.time_text_actor: self.renderer.RemoveActor(self.time_text_actor.actor)
         self.time_text_actor = Text2D(f"Time: {timestamp:.1f}s", pos="bottom-left", c='k')
         self.renderer.AddActor(self.time_text_actor.actor)
 
-        # Handle case with no data
-        if hardware_data_flat_array is None:
-            for actors in self.presentation_actors.values(): actors['shape'].color('grey'); actors['pct_text'].off()
-            # Also hide the summary bars and reset text when no data
-            if self.summary_bar_left: self.summary_bar_left.off(); self.summary_bar_right.off()
-            if self.summary_text_left: self.summary_text_left.text("Left: 0.0%"); self.summary_text_right.text("Right: 0.0%")
+        total_force = np.sum(hardware_data_flat_array) if hardware_data_flat_array is not None else 0.0
+
+        if total_force < 1.0:
+            for actors in self.presentation_actors.values():
+                actors['shape'].color('grey')
+                actors['pct_text'].off()
+            self.summary_text_left.text("Left: 0.0%")
+            self.summary_text_right.text("Right: 0.0%")
+            self.summary_bar_left.scale([0.001, 1, 1])
+            self.summary_bar_right.scale([0.001, 1, 1])
             return
 
-        # Calculate forces and update main arch display (as before)
         force_grid = np.full((self.hw_rows, self.hw_cols), 0.0); data_idx=0
         for r in range(self.hw_rows):
             for c in range(self.hw_cols):
-                if self.points_array_checker.is_valid(c,r) and data_idx < len(hardware_data_flat_array): force_grid[r, c] = hardware_data_flat_array[data_idx]; data_idx += 1
-        total_force = np.sum(hardware_data_flat_array)
-        if total_force < 1.0: self.render_grid_view(timestamp, None); return
+                if self.points_array_checker.is_valid(c,r) and data_idx < len(hardware_data_flat_array):
+                    force_grid[r, c] = hardware_data_flat_array[data_idx]; data_idx += 1
         
-        mapped_segment_forces = {i:0.0 for i in range(14)}; mapped_segment_avg_force = {i:0.0 for i in range(14)}
+        mapped_segment_forces = {i: 0.0 for i in range(14)}
+        mapped_segment_avg_force = {i: 0.0 for i in range(14)}
         for seg_idx in range(len(self.mapping_polygons)):
             segment_force = 0.0; cells = self.segment_cell_map.get(seg_idx, [])
             if cells:
-                for r,c in cells: segment_force += force_grid[r,c]
-                mapped_segment_forces[seg_idx] = segment_force; mapped_segment_avg_force[seg_idx] = segment_force/len(cells)
-
+                for r_idx, c_idx in cells: segment_force += force_grid[r_idx, c_idx]
+                mapped_segment_forces[seg_idx] = segment_force
+                mapped_segment_avg_force[seg_idx] = segment_force / len(cells)
+        
         total_left_force, total_right_force = 0.0, 0.0
         for seg_idx in range(14):
             if seg_idx not in self.presentation_actors: continue
             force = mapped_segment_forces.get(seg_idx, 0.0)
             avg_force = mapped_segment_avg_force.get(seg_idx, 0.0)
-            percentage = (force / total_force) * 100.0 if total_force > 0 else 0.0
-            if seg_idx < 7: total_right_force += force # Data seg 0-6 is patient right
+            percentage = (force / total_force) * 100.0
+            if seg_idx < 7: total_right_force += force
             else: total_left_force += force
             actors = self.presentation_actors[seg_idx]
             actors['shape'].color(self._value_to_color_hardware(avg_force, sensitivity))
             if percentage > 0.5: actors['pct_text'].on().text(f"{percentage:.1f}%")
             else: actors['pct_text'].off()
         
-        # --- CORRECTED SUMMARY BAR LOGIC ---
-        # 1. Remove old bars and text
-        if self.summary_bar_left: self.parent_plotter.remove([self.summary_bar_left, self.summary_bar_right, self.summary_text_left, self.summary_text_right])
+        # --- CORRECTED SUMMARY BAR UPDATE LOGIC ---
+        left_pct = (total_left_force / total_force) * 100.0
+        right_pct = (total_right_force / total_force) * 100.0
+        
+        self.summary_text_left.text(f"Left: {left_pct:.1f}%")
+        self.summary_text_right.text(f"Right: {right_pct:.1f}%")
 
-        # 2. Calculate percentages
-        left_pct = (total_left_force/total_force)*100.0 if total_force > 0 else 0.0
-        right_pct = (total_right_force/total_force)*100.0 if total_force > 0 else 0.0
-
-        # 3. Define layout for bars
-        bar_y_center = -7.0
-        bar_height = 1.0
-        bar_max_width = 7.0
+        # Get the layout again to find the lowest point for positioning
+        layout = self._define_explicit_tscan_layout()
+        if not layout: return # Should not happen if we got this far
+        
+        min_y = min(p['center'][1]-p['height']/2 for p in layout.values())
+        bar_y_center = min_y - 1.5
         bar_gap = 0.4
         
-        # 4. Recreate the bars and text each frame
-        # Left Bar
-        left_width = bar_max_width * (left_pct / 100.0)
-        left_center_x = -bar_gap/2 - left_width/2
-        self.summary_bar_left = Mesh.rectangle(pos=(left_center_x, bar_y_center, 0), width=left_width, height=bar_height).color('green').alpha(0.7)
-        self.summary_text_left = Text3D(f"Left: {left_pct:.1f}%", s=0.8, justify='center', c='white').pos(left_center_x, bar_y_center, 0.1).follow_camera()
+        left_scale_x = max(0.001, left_pct / 100.0)
+        new_left_width = self.bar_max_width * left_scale_x
+        new_left_center_x = -bar_gap/2 - new_left_width/2
+        self.summary_bar_left.scale([left_scale_x, 1, 1]).pos(new_left_center_x, bar_y_center, 0)
         
-        # Right Bar
-        right_width = bar_max_width * (right_pct / 100.0)
-        right_center_x = bar_gap/2 + right_width/2
-        self.summary_bar_right = Mesh.rectangle(pos=(right_center_x, bar_y_center, 0), width=right_width, height=bar_height).color('firebrick').alpha(0.7)
-        self.summary_text_right = Text3D(f"Right: {right_pct:.1f}%", s=0.8, justify='center', c='white').pos(right_center_x, bar_y_center, 0.1).follow_camera()
-
-        # 5. Add the new actors to the plotter
-        self.parent_plotter.add([self.summary_bar_left, self.summary_bar_right, self.summary_text_left, self.summary_text_right])
+        right_scale_x = max(0.001, right_pct / 100.0)
+        new_right_width = self.bar_max_width * right_scale_x
+        new_right_center_x = bar_gap/2 + new_right_width/2
+        self.summary_bar_right.scale([right_scale_x, 1, 1]).pos(new_right_center_x, bar_y_center, 0)
         # --- END CORRECTION ---
         
     def animate(self, timestamp, data, sensitivity=1):
         self.render_grid_view(timestamp, data, sensitivity)
+        print(self.bar_max_width)
 
     def _value_to_color_hardware(self, value, sensitivity=1):
         # ... (This function remains unchanged) ...
