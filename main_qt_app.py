@@ -22,6 +22,10 @@ from points_array import PointsArray         # Your PointsArray definition
 from hardware_grid_visualizer_qt import HardwareGridVisualizerQt # Your 2D grid
 from hardware_3d_bar_visualizer_qt import Hardware3DBarVisualizerQt # Your "working git version"
 
+# Hardware integration imports
+from hardware_data_acquisition import HardwareDataAcquisition, HardwareDataProcessor
+from hardware_connection_dialog import HardwareConnectionDialog
+
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
@@ -301,6 +305,23 @@ class MainAppWindow(QMainWindow):
         self.vedo_multiview_widget.mouse_interaction_ended.connect(self.handle_mouse_interaction_ended)
         # --- End signal connection ---
         
+        # --- Hardware Integration ---
+        # Initialize hardware data acquisition
+        self.hardware_acquisition = HardwareDataAcquisition()
+        self.hardware_processor = HardwareDataProcessor(PointsArray())
+        
+        # Connect hardware data signals
+        self.hardware_acquisition.data_received.connect(self.on_hardware_data_received)
+        self.hardware_acquisition.connection_status_changed.connect(self.on_hardware_connection_changed)
+        
+        # Hardware connection dialog (will be created when needed)
+        self.hardware_connection_dialog = None
+        
+        # Hardware data state
+        self.hardware_data_available = False
+        self.latest_hardware_data = None
+        # --- End Hardware Integration ---
+        
         self.detailed_info_label = QLabel("Click an element for details or hover over graph points.")
         self.detailed_info_label.setWordWrap(True)
         self.detailed_info_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
@@ -341,6 +362,11 @@ class MainAppWindow(QMainWindow):
     
     def get_latest_hw_data_for_step(self):
         # ... (as before) ...
+        # First check if hardware data is available
+        if self.hardware_data_available and self.latest_hardware_data:
+            return self.latest_hardware_data
+        
+        # Fall back to existing hardware data source (simulation)
         if self.hw_data_source and hasattr(self.hw_data_source, 'running') and self.hw_data_source.running:
             if hasattr(self.hw_data_source, 'get_latest_raw_forces'):
                 return self.hw_data_source.get_latest_raw_forces()
@@ -391,13 +417,19 @@ class MainAppWindow(QMainWindow):
         update_arch_button = QPushButton("Update Arch")
         update_arch_button.clicked.connect(self.on_update_arch_clicked)
         
+        # Hardware connection button
+        hardware_connect_button = QPushButton("Hardware Connection")
+        hardware_connect_button.clicked.connect(self.show_hardware_connection_dialog)
+        hardware_connect_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
+        
         arch_controls_layout.addWidget(arch_label)
         arch_controls_layout.addWidget(self.ci_width_input)
+        arch_controls_layout.addWidget(update_arch_button)
+        arch_controls_layout.addWidget(hardware_connect_button)
         
         control_panel_layout.addLayout(arch_controls_layout)
-        control_panel_layout.addWidget(update_arch_button)
-        # --- END UI for User Input ---
-
+        # Remove the separate addWidget for update_arch_button since it's now in the layout
+        # control_panel_layout.addWidget(update_arch_button)
         control_panel_layout.addStretch() # Pushes controls to the top
         top_area_layout.addLayout(control_panel_layout, 1)
 
@@ -452,7 +484,8 @@ class MainAppWindow(QMainWindow):
         else:
             # User wants to PLAY
             can_animate = (self.processor.timestamps and len(self.processor.timestamps) > 0) or \
-                          (self.hw_data_source and hasattr(self.hw_data_source, 'running') and self.hw_data_source.running)
+                          (self.hw_data_source and hasattr(self.hw_data_source, 'running') and self.hw_data_source.running) or \
+                          (self.hardware_data_available and self.latest_hardware_data)
             if not can_animate:
                 logging.warning("Cannot start animation: No data source.")
                 return
@@ -477,7 +510,11 @@ class MainAppWindow(QMainWindow):
         latest_hardware_flat_data = None
         sensitivity_from_ui = 1 
 
-        if self.hw_data_source and hasattr(self.hw_data_source, 'running') and self.hw_data_source.running:
+        # First check for hardware data
+        if self.hardware_data_available and self.latest_hardware_data:
+            latest_hardware_flat_data = self.latest_hardware_data
+            current_display_timestamp = time.time()
+        elif self.hw_data_source and hasattr(self.hw_data_source, 'running') and self.hw_data_source.running:
             latest_hardware_flat_data = self.get_latest_hw_data_for_step()
             current_display_timestamp = time.time() 
         elif self.processor.timestamps and len(self.processor.timestamps) > 0 :
@@ -579,11 +616,84 @@ class MainAppWindow(QMainWindow):
         # ... (as before) ...
         self.detailed_info_label.setText(info_str)
 
+    # --- Hardware Integration Methods ---
+    
+    def on_hardware_data_received(self, data):
+        """Handle data received from hardware"""
+        self.latest_hardware_data = data
+        self.hardware_data_available = True
+        
+        # Update visualizations with hardware data
+        if self.vedo_multiview_widget and self.vedo_multiview_widget.bar_visualizer:
+            current_time = time.time()
+            self.vedo_multiview_widget.update_views(current_time, data, 1)
+    
+    def on_hardware_connection_changed(self, connected, status_message):
+        """Handle hardware connection status changes"""
+        if connected:
+            logging.info(f"Hardware connected: {status_message}")
+            self.hardware_data_available = True
+        else:
+            logging.info(f"Hardware disconnected: {status_message}")
+            self.hardware_data_available = False
+    
+    def show_hardware_connection_dialog(self):
+        """Show the hardware connection dialog"""
+        if not self.hardware_connection_dialog:
+            self.hardware_connection_dialog = HardwareConnectionDialog(self.hardware_acquisition, self)
+            self.hardware_connection_dialog.connection_established.connect(self.on_hardware_connection_established)
+            self.hardware_connection_dialog.connection_lost.connect(self.on_hardware_connection_lost)
+        
+        self.hardware_connection_dialog.show()
+        self.hardware_connection_dialog.raise_()
+        self.hardware_connection_dialog.activateWindow()
+    
+    def on_hardware_connection_established(self):
+        """Handle successful hardware connection"""
+        logging.info("Hardware connection established")
+        # You can add additional logic here when hardware connects
+    
+    def on_hardware_connection_lost(self):
+        """Handle hardware connection loss"""
+        logging.info("Hardware connection lost")
+        # You can add additional logic here when hardware disconnects
+    
+    def get_hardware_data_for_visualization(self):
+        """Get hardware data formatted for visualization components"""
+        if not self.hardware_data_available or not self.latest_hardware_data:
+            return None
+        
+        # Convert raw hardware data to the format expected by visualizers
+        force_matrix, valid_positions = self.hardware_processor.convert_to_force_matrix(
+            self.latest_hardware_data
+        )
+        
+        if force_matrix.size > 0:
+            return {
+                'force_matrix': force_matrix,
+                'valid_positions': valid_positions,
+                'raw_data': self.latest_hardware_data,
+                'timestamp': time.time()
+            }
+        
+        return None
+    
+    def is_hardware_connected(self):
+        """Check if hardware is currently connected"""
+        return self.hardware_acquisition.is_connected()
+    
+    # --- End Hardware Integration Methods ---
+
     def closeEvent(self, event):
         logging.info("Main window closing...")
         self.animation_timer.stop() 
         self.user_wants_animation_playing = False # Explicitly set state
         self.is_temporarily_paused_for_interaction = False
+        
+        # Clean up hardware acquisition
+        if hasattr(self, 'hardware_acquisition'):
+            self.hardware_acquisition.cleanup()
+        
         if hasattr(self, 'video_writer') and self.video_writer and self.video_writer.isOpened():
             logging.info("Releasing video writer from MainAppWindow closeEvent.")
             self.video_writer.release()
